@@ -1,0 +1,876 @@
+#!/bin/bash
+#############################################################
+#############################################################
+#  Interactive DOCKER build manager
+#
+#  Notes: This file builds an interactive docker image from 
+#  user input. The image can be configured by the user accordingly
+#  to host machine hardware and desired libraries for HW acceleration
+#  
+#  Three types of issues have kept in mind while choosing configuration:
+#       1. Support for different linux base distributions
+#       2. Support (or not) for different NVIDIA drivers
+#       3. Support for different OpenCV distribution
+#       4. Install additional tools in target OS
+#       5. Install developeer tools in target OS
+#       6. Install D.E. King DLIB library
+#       7. Install Python with Deep Learning tools
+#       8. Install base python requirements
+#       9. 
+
+
+#############################################################
+#############################################################
+##                      COMMAND LINE PARSER
+#############################################################
+#############################################################
+LEFT=()
+DEFAULT_APT=false
+DEFAULT_COMPONENT=""
+DEFAULT_NVIDIA=false
+DEFAULT_DIST=false
+DEFAULT_DEVM=false
+DEFAULT_DLIB=false
+DEFAULT_APP=false
+
+#Define the default base system from which build in interactive mode
+ENGINE="ubuntu:18.04"
+
+while [[ $# -gt 0 ]]
+do
+opt="$1"
+
+case $opt in
+    --default)
+    DEFAULT_APT=true
+    DEFAULT_NVIDIA=true
+    DEFAULT_DIST=true
+    DEFAULT_DEVM=true
+    DEFAULT_DLIB=true
+    DEFAULT_APP=true
+    shift # past value
+    ;;
+    -u|--user)
+    echo "Enabling user into docker interactive"
+    userdocker=true
+    shift
+    ;;
+    -n|--name)
+    dockername="$2"
+    echo "Interactive mode with machine name"
+    shift
+    shift
+    ;;
+    -a|--attach)
+    echo "Attaching to existing docker engine"
+    attachdocker=true
+    shift
+    ;;
+    -c|component)
+    DEFAULT_COMPONENT=$2
+    shift
+    shift
+    ;;
+    -e|--engine)
+    ENGINE=$2
+    shift
+    shift
+    ;;
+    -i|--interactive)
+    runmode="interactive"
+    shift
+    ;;
+    -h|--help)
+    echo "This program build Docker Images for different architectures"
+    echo "Most options will be asked interactively."
+    echo "user can however set few of them from command line"
+    echo " "
+    echo "USAGE buildImage [-a|--attach][--default][-h|--help][-i|--interactive][-n|--name][-u|--user]"
+    echo " "
+    echo " "
+    echo " --attach Attachs to an existing build engine "
+    echo " --component value Execute only one build step [OpenCV|DLIB] "
+    echo " --defaults skips most questions and use defaults"
+    echo " --help prints this help notes"
+    echo " --interactive enter an interactive modality for build"
+    echo " --name assign a name to the running interactive container"
+    echo " --user switch to user in the interactive container"
+    exit 0
+    ;;
+    *)    # unknown option
+    LEFT+=("$1") # save it in an array for later
+    shift # past argument
+    ;;
+esac
+done
+set -- "${LEFT[@]}" # restore positional parameters
+
+
+clion=$(echo /usr/local/clion*)
+pycharm=$(echo /usr/local/pycharm*)
+mlab="/use/local/matlab"
+mount_dirs=("$clion" "$pycharm" "$mlab")
+
+USERNAME=root
+#$(whoami)
+US_ID=$(id -u $USERNAME)
+US_GID=$(id -g $USERNAME)
+DOCKER_OPT="-v /home/$USERNAME:/home/$USERNAME --workdir /home/$USERNAME "
+DOCKER_OPT+="--net=host --privileged -v/dev:/dev "
+DOCKER_OPT+="-v /tmp/X11-unix:/tmp/X11-unix -e DISPLAY=$DISPLAY "
+DOCKER_OPT+="-e QT_X11_NO_MITSHM=1 -e XDG_RUNTIME_DIR=/tmp "  
+
+# REMAPS USER IN DOCHER
+DOCKER_USR+="-v/etc/passwd:/etc/passwd:ro -v/etc/shadow:/etc/shadow:ro "
+DOCKER_USR+="-v/etc/group:/etc/group:ro  "
+DOCKER_USR+="-v/etc/sudoers.d:/etc/sudoers.d:ro "
+DOCKER_USR+="-e LOCAL_USER_ID=$US_ID -e LOCAL_GROUP_ID=$US_GID "
+DOCKER_USR+="-e LOCAL_GROUP_NAME=$USERNAME -e USER=$USERNAME "
+DOCKER_USR+="--user $US_ID:$US_GID"
+
+userdocker && DOCKER_OPT+=" $DOCKER_USR"
+
+# DEFINE NVIDIA OPTIONS
+DOCKER_NV=" -e LD_LIBRARY_PATH=$( ls -d -1 /usr/lib/nvidia*  )"
+DOCKER_NV+="-v /usr/lib/nvidia-410:/usr/lib/nvidia-410:ro "
+DOCKER_NV+="-v /usr/lib/nvidia-410:/usr/lib/nvidia:ro "
+
+DOCKER_DIRS=""
+for tdir in ${mount_dirs[@]} ; 
+do
+	test -d tdir && DOCKER_DIRS+="-v $tdir:$tdir:ro "
+done
+
+DOCKER_CFG="$DOCKER_OPT $DOCKER_DIRS"
+#DOCKER_CFG="$DOCKER_OPT $DOCKER_USR $DOCKER_DIRS"
+
+##########################################################################
+
+interactive=false
+if [ "$runmode" == "interactive" ] ; then
+	xhost +
+   echo "Launching DOCKER for test..."
+   echo "docker run -v$(pwd):/setup $DOCKER_CFG -ti ubuntu:18.04 /bin/bash --init-file /setup/buildImage"
+   docker run -v$(pwd):/setup $DOCKER_CFG -ti $ENGINE /bin/bash --init-file /setup/buildImage
+   exit 0
+else
+   if [ -d /setup ] ; then
+        echo "Now running the TEST modality in a secure DOCKER 18.04"
+	cd /setup
+	interactive=true
+   else 
+        echo "running generation mode ($1)"
+   fi
+fi
+
+echo -e "\e[92m" 
+echo "**********************************************************"
+echo "**********************************************************"
+echo "**           Machine Configuration Script               **"
+echo "**                                                      **"
+echo "** This scripts installs a complete Docker Image with a **"
+echo "** flexible setup environment, and allows you testing   **"
+echo "** different flavours of OSes and Profiling optimization**"
+echo "**                                                      **"
+echo "** (C) PERCRO - 2019-2024                               **"
+echo "**********************************************************"
+echo "**********************************************************"
+
+# Init some variavles
+dockerfile=""
+DBG=true
+WAIT_TOUT=60
+APT_CMD=apt
+C_BLACK="\e[30m"
+C_RED="\e[31m"
+C_GREEN="\e[32m"
+C_YELLOW="\e[33m"
+C_BLUE="\e[34m"
+C_MAGENTA="\e[35m"
+C_CYAN="\e[36m"
+C_LGRAY="\e[37m"
+C_GRAY="\e[90m"
+C_LRED="\e[91m"
+C_LGREEN="\e[92m"
+C_LYELLOW="\e[93m"
+C_LBLUE="\e[94m"
+C_LMAGENTA="\e[95m"
+C_LCYAN="\e[96m"
+C_WHITE="\e[97m"
+C_NORMAL="\e[30m"
+
+
+
+#############################################################
+# FUNCTION DEFINITIION
+
+function dockeradd() { 
+  if $interactive ; then
+  echo -e "REM REQUEST TO ADD: $*"
+  else
+	dockerfile+=$(echo "$* \n\n") 
+  fi
+}
+
+function dockerAPT() { 
+  if $interactive ; then
+  echo -e "$APT_CMD install -yq $*" 
+  eval "DEBIAN_FRONTEND=noninteractive $APT_CMD install -yq $*"
+  else
+  	dockerfile+=$(echo "CMD DEBIAN_FRONTEND=noninteractive $APT_CMD install -yq $1 \n\n") 
+  fi
+}
+
+function dockerFROM() { 
+  if $interactive ; then
+  echo -e "FROM $*" 
+  else
+	dockerfile+=$(echo "FROM $* \n\n") 
+  fi
+}
+
+
+function dockerCMD() { 
+  if $interactive ; then
+  echo -e "EXEC $*" 
+  eval "$*"
+  else
+	dockerfile+=$(echo "CMD $* \n\n") 
+  fi
+}
+
+
+function input_ANS() {
+	echo -e "$C_LYELLOW "
+	echo " $1"
+	read -t $WAIT_TOUT ANS || ANS="$2"
+	[ "$ANS" == "" ] && ANS="$2"
+	ANS=${ANS,,}	
+}
+
+
+function PYsetupADD() { 
+  if $interactive ; then
+  echo -e "EXEC(PYTHON): $1" 
+  else
+	PYsetup+=$(echo "$1\n") 
+  fi
+}
+
+
+
+############################################################
+# LINUX DISTRIBUTION SELECTION
+if [ "$DEFAULT_COMPONENT" == "" ] ; then
+	echo -e "$C_LBLUE "
+	echo "******************************************************"
+	echo "**     1. LINUX DISTRIBUTION SELECTION              **"
+	echo "******************************************************"
+	echo "Linux flavour:"
+
+	OS_REL=("ubuntu:16.04" "ubuntu:17.04" "ubuntu:18.04" "ubuntu:18.10" "ubuntu:19.04" "nvidia/cuda:9.2-cudnn7-devel-ubuntu18.04" "nvidia/cuda:10.0-base-ubuntu18.04 ")
+	PKGS_1604="libpcl-apps1.7"
+	PKGS_1704="libpcl-apps1.7"
+	PKGS_1804="libpcl-apps1.8"
+	PKGS_1810="libpcl-apps1.8"
+	PKGS_1904="libpcl-apps1.9"
+	PKGS_NCU92="libpcl-apps1.8"
+	PKGS_NCU10="libpcl-apps1.8"
+	OS_PKGS=("$PKGS_1604" "$PKGS_1704" "$PKGS_1804" "$PKGS_1810" "$PKGS_1904" "$PKGS_1804" "$PKGS_1804" )
+	ind=1
+	for os_rel in "${OS_REL[@]}"
+	do
+		echo "$ind: Linux Distribution $os_rel"
+		ind=$(( "$ind" + 1 ))
+	done
+	echo " "
+	echo -e "$C_LYELLOW "
+	ANS="3"
+	$DEFAULT_DIST || input_ANS " Select your choice [3]?" "3"
+	$DBG && echo "OSselection VAL: $ANS"
+	OS_rel=${OS_REL[ $(( "$ANS" -1 )) ]}
+	OS_pkgs=${OS_PKGS[ $(( "$ANS" -1 )) ]}
+	echo -e "$C_LGREEN "
+	echo "Selected Linux version choice is: $OS_rel"
+
+	dockerFROM "$OS_rel"
+	dockerCMD "echo 'Acquire::ForceIPv4 \"true\";' | tee /etc/apt/apt.conf.d/99force-ipv4"
+	dockerCMD "DEBIAN_FRONTEND=noninteractive  apt update"
+	dockerAPT "software-properties-common apt-utils python3-dev python3-pip"
+else
+	echo "Skipping 1... Distribution selection"
+fi
+#add-apt-repository -y ppa:saiarcot895/myppa
+
+
+############################################################
+# NVIDIA GRAPHICS BOARD
+
+#
+# PREPARO IL SETUP PER AVERE NVIDIA E CUDA SULLA MACCHINA TARGET
+#
+echo -e "$C_LBLUE "
+echo "******************************************************"
+echo "**     2. NVIDIA DISTRIBUTION SELECTION             **"
+echo "******************************************************"
+echo "**"
+echo "** You may also build OpenCV using CUDA engine/drivers"
+echo "** You may also build OpenCV using CUDA engine/drivers"
+echo "** N   --> NO CUDA"
+echo "** 3.5 --> 920M 780 740 730 720 710 640 630 "
+echo "** 5.2 --> GTX 980M, 970M, 960M, 930, 860, 850, 845, 840, 830, 870"
+echo "** 6.1 --> Titan X, GTX 1080, 1070, 1060, 1050 1030"
+echo "** 7.2 --> Xavier"
+echo "** 7.5 --> TITAN RTX, 2080, 2070 2060"
+
+ANS="n"
+$DEFAULT_NVIDIA || input_ANS " Shall I use cuda/nvidia switches in build? [y/N]" "n"
+if [ "$ANS" == "n" ] ; then
+	echo "Ok, setting the switches on during build"
+	OCV_OPTCUDA="-DWITH_CUDA=OFF  -DWITH_XINE=OFF"
+else
+	echo "Ok, I disabling CUDA"
+	OCV_OPTCUDA="-DWITH_CUDA=ON  -DWITH_XINE=ON -DCUDA_ARCH_BIN=$ANS "
+fi
+
+
+############################################################
+# OPENCV SELECTION
+
+if [ "$DEFAULT_COMPONENT" == "" ] ; then
+
+	echo -e "$C_LGREEN "
+	echo "******************************************************"
+	echo "**     3. OPENCV DISTRIBUTION PKG SELECTION  (1)    **"
+	echo "******************************************************"
+	# BASE LINUX COMPONENTS FOR OPENCV
+	APT_BASE1="build-essential cmake git sudo nano net-tools pkg-config vim wget unzip yasm"
+	APT_BASE2="tesseract-ocr tesseract-ocr-eng qt5-default x264 v4l-utils"
+
+	APT_BASELIB1="libatlas-base-dev libaudit-dev libavcodec-dev libavformat-dev libavutil-dev"
+	APT_BASELIB2="libdc1394-22-dev libeigen3-dev libfftw3-dev libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev"
+	APT_BASELIB3="libgtk2.0-dev libjpeg-dev liblapack-dev libpcl-dev libpng-dev libswscale-dev"
+	APT_BASELIB4="libtbb-dev libtbb2 libtesseract-dev libtiff-dev libtbb-dev libtiff5-dev libtiff-dev"
+	APT_BASELIB5="libusb-1.0-0-dev libtheora-dev libvorbis-dev libvtk6-dev libx264-dev libxine2-dev libxvidcore-dev"
+	APT_BASELIB6="libv4l-dev libv4l-0 libv4l2rds0 libv4lconvert0 libxml2-dev libfaac-dev"
+	APT_BASELIB7="libopencore-amrnb-dev libopencore-amrwb-dev"
+
+
+
+	echo -e "$C_LGREEN "
+	echo "**"
+	echo "** NOW Configuring the Target installation."
+	echo "**     OpenCV needs the following packages installed:"
+	echo "**"
+	echo -e "$C_LBLUE "
+	echo "** Base App:"
+	echo "** $APT_BASE1"
+	echo "** $APT_BASE2"
+	echo "**"
+	echo "** BASE LIBRARIES"
+	echo "** $APT_BASELIB1"
+	echo "** $APT_BASELIB2"
+	echo "** $APT_BASELIB3"
+	echo "** $APT_BASELIB4"
+	echo "** $APT_BASELIB5"
+	echo "** $APT_BASELIB6"
+	echo "** $APT_BASELIB7"
+	echo -e "$C_LGREEN "
+	echo "******************************************************"
+	echo "**"
+	APT_COMPONENTS="$APT_BASE1 $APT_BASE2 $APT_BASELIB1 $APT_BASELIB2 $APT_BASELIB3 $APT_BASELIB4 $APT_BASELIB5 $APT_BASELIB6 $APT_BASELIB7"
+
+	APT_PKGS=""
+
+	ANS="y"
+	$DEFAULT_APT || input_ANS "Shall we install BASE openCV Framework Y/n?" "Y"
+	test "$ANS" == "y" && {
+		echo "Additional components for OpenCV build have been added to Image"
+		APT_PKGS+="$APT_COMPONENTS"
+	}
+
+else
+echo "Skipping ... 3 DISTRIBUTION PKG SELECTION"
+fi
+
+
+echo -e "$C_LGREEN "
+echo "******************************************************"
+echo "**     3. OPENCV DISTRIBUTION SELECTION  (2)        **"
+echo "******************************************************"
+OCV_REL=(4.0.1 3.4.5 3.3.1 3.2.0 3.1.0 2.4.13.6)
+ind=1
+echo -e "$C_LBLUE "
+for ocv_rel in "${OCV_REL[@]}"
+do
+	echo "$ind: Release $ocv_rel"
+	ind=$(( "$ind" + 1 ))
+done
+echo " "
+input_ANS " Select your OpenCV choice [1]?" "3"
+OCV_VERSION=${OCV_REL[ $(( "$ANS" -1 )) ]}
+echo -e "$C_LGREEN "
+echo "Your OpenCV version choice is: $OCV_VERSION"
+
+############################################################
+# ADDITIONAL SYSTEM TOOLS
+
+if [ "$DEFAULT_COMPONENT" == "" ] ; then
+
+	APT_TOOLS="ant bc curl zlib1g-dev gdb inetutils-ping  net-tools"
+	echo -e "$C_LGREEN "
+	echo "******************************************************"
+	echo "**     4. ADDITIONAL TOOLS IN TARGET IMAGE          **"
+	echo "******************************************************"
+	echo "**"
+	echo " Would you like to integrate the following tools:"
+	echo "**"
+	echo -e "$C_LBLUE "
+	echo "** $APT_TOOLS"
+	echo "**"
+	ANS="y"
+	$DEFAULT_APP || input_ANS "Shall I use them Y/n?" "Y"
+	test "$ANS" == "y" && {
+		echo "Optional Tools have been added to the image"
+		APT_PKGS+=" $APT_TOOLS"
+	}
+
+	APT_DEVP1="default-jdk doxygen g++ gfortran protobuf-compiler python-dev python-pip python-numpy python-tk"
+	APT_DEVP2="python3-tk python3-numpy tesseract-ocr-dev tesseract-ocr-ita"
+	APT_DEVLIB1="libboost-all-dev libffi-dev libfreetype6-dev libgdal-dev libgflags-dev libgoogle-glog-dev"
+	APT_DEVLIB2="libhdf5-dev liblcms2-dev liblept5 libleptonica-dev  libopenblas-dev"
+	APT_DEVLIB3="libopenexr-dev $OS_pkgs libprotobuf-dev libleveldb-dev liblmdb-dev"
+	APT_DEVLIB4="libsnappy-dev libssl-dev libwebp-dev libzmq3-dev"
+
+	APT_DEVELOPER="$APT_DEVP1 $APT_DAVP2 $APT_DEVLIB1 $APT_DEVLIB2 $APT_DEVLIB3 $APT_DEVLIB4"
+
+else
+	echo "Skipping ... 4 ADDITIONAL TOOL IN TARGET"
+fi
+
+############################################################
+#  DEVELOPER TOOLS
+if [ "$DEFAULT_COMPONENT" == "" ] ; then
+	echo -e "$C_LGREEN "
+	echo "******************************************************"
+	echo "**     5. DEVELOPER  TOOLS IN TARGET IMAGE          **"
+	echo "******************************************************"
+	echo "**"
+	echo "** NOW Configuring optional Developer packages"
+	echo "**     the following additional packages will be installed:"
+	echo "**"
+	echo "** Optional PKGS:"
+	echo "**"
+	echo -e "$C_LBLUE "
+	echo "** $APT_DEVP1"
+	echo "** $APT_DEVP2"
+	echo "** $APT_DEVLIB1"
+	echo "** $APT_DEVLIB2"
+	echo "** $APT_DEVLIB3"
+	echo "** $APT_DEVLIB4"
+	echo -e "$C_LGREEN "
+	echo "**"
+	ANS="N"
+	$DEFAULT_DEVM || input_ANS "Shall I use them y/N?" "N"
+	test "$ANS" == "y" && {
+		developer "tools will be added to the image"
+		APT_PKGS+=" $APT_DEVELOPER"
+	}
+else
+	echo "Skipping... 5 DEVELOPER TOOLS IN TARGET IMAGE"
+fi
+
+############################################################
+# DLIB Download and install section
+DLIB_link="https://github.com/davisking/dlib/archive/"
+DLIB_REL=("19.17" "19.16" "19.15" "19.13" "19.9" "19.7"  "19.6"  "19.4" "19.2")
+echo -e "$C_LGREEN "
+echo "******************************************************"
+echo "**     6. DLIB Vision Libraries in target Image     **"
+echo "******************************************************"
+echo "**"
+echo "** NOW we configure dlib.net library in image"
+echo "**     DLIB allows standalone development of basic vision"
+echo "**     application with advanced and optimized algebras and"
+echo "**     ML libraries. DLIB is offered by Davis King as open source"
+echo "**"
+ind=1
+echo -e "$C_LBLUE "
+for DLIB_rel in "${DLIB_REL[@]}"
+do
+	echo "$ind: DLIB Distribution $DLIB_rel"
+	ind=$(( "$ind" + 1 ))
+done
+echo "**"
+echo "**"
+
+input_ANS " Select your DLIB choice [2]?" "2"
+DLIB_VERSION=${DLIB_REL[ $(( "$ANS" -1 )) ]}
+echo -e "$C_LGREEN "
+echo "Your DLIB version choice is: $DLIB_VERSION"
+
+
+
+
+############################################################
+# PYTHON AND MACHINE LEARN install section
+PY2_PKGS=""
+PY3_PKGS=""
+
+PY_DESC=(\
+" Base computing packages      " \
+" Development tools (Ipython..)" \
+" Advanced computing and learn " \
+" tensorflow-keras NO-GPU      " \
+" Add SNI support to Python    " \
+" PY-Torch                     " \
+" Screen capture tool          " \
+" Command line parser          " \
+" Colored lint                 " \
+"Crontab manager              " \
+"Tabular dataser manager      " \
+"Open Document Format tool    " \
+"Excel toolbox                " \
+"CSV manager                  " \
+"COCO Dataset                 " \
+"tensorflow-keras GPU         " \
+"Pythons utils                " )
+
+PY_SEL=( 1 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4)
+PY_SEL=( 1 1 1 1 1 1 1 1 1 1 1 1 1 1 4 4 4)
+
+PY_MOD=("numpy scipy pandas matplotlib scikit-image" \
+"ipython Cython ipykernel jupyter path.py Pillow pygments six sphinx wheel zmq" \
+"nose sklearn sympy imgaug" \
+"tf-nightly Keras keras-rcnn " \
+"pyopenssl ndg-httpsclient pyasn1" \
+"torch torch-vision" \
+"mss" \
+"docopt" \
+"clint" \
+"crontab" \
+"tablib" \
+"odfpy" \
+"openpyxl" \
+"unicodeCSV" \
+"coco pycocotools" \
+"tf-nightly-gpu Keras keras-rcnn " \
+"utils")
+
+
+if [ "$DEFAULT_COMPONENT" == "" ] ; then
+
+echo -e "$C_LGREEN "
+echo "******************************************************"
+echo "**     7a. PYTHON Setup in the Target Environment    **"
+echo "******************************************************"
+echo "**"
+echo "** Python 2 is going to be discontinued in 2020"
+echo "** First We select Python2 Option"
+echo "**"
+input_ANS " Should I include Python2 in configuration [y/N]?" "N"
+PY2="$ANS"
+
+if [ "$PY2" == "y" ] ; then 
+  echo "Both python2 and python3 will be available in the target image"
+  APT_PKGS+=" python-dev python-pip"
+else
+  echo "Only python3 is selected"
+fi
+
+
+echo "******************************************************"
+echo "**  THEN we select module options"
+echo "**"
+
+ANS1="1"
+while [ "$ANS1" != "*" ] ; do
+	echo -e "$C_LBLUE "
+	echo "Optional Python Components:"
+	echo "NUM  TYPE          STATUS         PKGS"
+	for ind in {0..18}
+	do
+		echo "$((ind+1)): ${PY_DESC[$ind]}   ${PY_SEL[$ind]}    ${PY_MOD[$ind]}"
+	done
+	echo "**"
+	echo -e "$C_LYELLOW "
+	echo "** Possible commands are:
+	echo "#Number #Value "
+        echo " where: (return or *) exits"
+	echo "1. only Python 3  | 2. Python 2/3  |  3. Only Python 2  |  4. none"
+	ANS1="*"
+	ANS2="4"
+	read -t $WAIT_TOUT ANS1 ANS2
+	if ((  ("$ANS1" > 0) && ( "$ANS1" < 20 ) )) ; then
+		PY_SEL[ (( "$ANS1" -1 )) ]="$ANS2"
+	else
+		break
+	fi
+done
+
+PY2_PKGS=""
+PY3_PKGS=""
+
+for ind in {0..18}
+do
+  test ${PY_SEL[$ind]} == "1" && PY3_PKGS+=" ${PY_MOD[$ind]}"
+  test ${PY_SEL[$ind]} == "2" && PY3_PKGS+=" ${PY_MOD[$ind]}"
+  test ${PY_SEL[$ind]} == "2" && PY2_PKGS+=" ${PY_MOD[$ind]}"
+  test ${PY_SEL[$ind]} == "3" && PY2_PKGS+=" ${PY_MOD[$ind]}"
+done
+
+
+echo -e "$C_LGREEN "
+echo "******************************************************"
+echo "**     7b. PYTHON IDE Setup                         **"
+echo "******************************************************"
+echo "**"
+echo -e "$C_LBLUE "
+echo "**   1. None I will do it by myself"
+echo "**   2. Spyder for python2/3"
+echo "**   3. Spyder3 for python3"
+echo "**   4. Wing personal for Academic and personal use (v 6.1.4-1)"
+echo "**   5. /opt/Rodeo/rodeo (rodeo.yhat.com)"
+echo "**   ATOM+HYDROGEN (Do it manually)"
+echo "**"
+input_ANS " Select you choice [1]?" "1"
+
+case $ANS in
+	1)
+	;;
+	2)
+	PY2_PKGS+="spyder spyder-kernels==0.2.6"
+	;;
+	3)
+	PY3_PKGS+="spyder3 spyder-kernels==0.2.6"
+	;;
+	4)
+	APT_PKGS+=" libpango1.0-0 xdg-utils libpangox-1.0-0 "
+	USE_WINGIDE=true
+	;;
+	5)
+	dockerCMD "apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 33D40BC6"
+	dockerCMD "add-apt-repository -u 'deb http://rodeo-deb.yhat.com/ rodeo main' "
+	dockerAPT "apt-get -y install rodeo"
+	;;
+esac
+
+
+else
+echo "Skipping... 7. PYTHON PKGS CONFIGURATION"
+fi
+
+#######################################################################
+
+OCV_CDir=$(pwd)/opencv_contrib-${OCV_VERSION}/modules
+OCV_OPT="-DBUILD_TIFF=ON -DWITH_EIGEN=ON -DWITH_OPENGL=ON -DWITH_OPENCL=ON"
+OCV_OPT+=" -DWITH_IPP=ON -DWITH_QT=ON -DWITH_TBB=ON -DBUILD_opencv_java=OFF"
+OCV_OPT+=" -DENABLE_PRECOMPILED_HEADERS=OFF -DCMAKE_BUILD_TYPE=RELEASE"
+OCV_OPT+=" -DOPENCV_EXTRA_MODULES_PATH=${OCV_CDir} -DOPENCV_ENABLE_NONFREE=ON"
+OCV_OPT+=" -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF -DWITH_GDAL=ON -DWITH_V4L=ON"
+OCV_OPT+=" -DCMAKE_INSTALL_PREFIX=/usr/local -DOPENCV_FORCE_PYTHON_LIBS=ON -DWITH_LIBV4L=ON"
+
+OCV_OPTPY="-DBUILD_opencv_python2=ON -DPYTHON_EXECUTABLE=$(which python) -DPYTHON_INCLUDE_DIR=$(python -c 'from distutils.sysconfig import get_python_inc; print(get_python_inc())') -DPYTHON_PACKAGES_PATH=$(python -c 'from distutils.sysconfig import get_python_lib; print(get_python_lib())')"
+
+OCV_OPTPY3="-DBUILD_opencv_python3=ON -DPYTHON3_EXECUTABLE=$(which python3)"
+OCV_OPTPY3+=" -DPYTHON3_INCLUDE_DIR=$(python3 -c 'from distutils.sysconfig import get_python_inc; print(get_python_inc())')"
+OCV_OPTPY3+=" -DPYTHON3_PACKAGES_PATH=$(python3 -c 'from distutils.sysconfig import get_python_lib; print(get_python_lib())')"
+#OCV_OPTPY3+=" -DPYTHON3_PACKAGES_PATH=$(python3 -c 'import site; print(site.getsitepackages()[0])')"
+
+OCV_OTHER=""
+
+echo "******************************************************"
+echo "**     8. Configure OCV Build                       **"
+echo "******************************************************"
+
+input_ANS " Should I include build with AVX [y/N]?" "N"
+[ "$ANS" == "y" ] && ( echo "AVX enbled"; OCV_OTHER+="-DENABLE_AVX=ON" ) 
+[ "$ANS" == "y" ] ||  echo "AVX disabled" 
+[ "$ANS" == "y" ] && DLIB_BUILD="cmake -DUSE_AVX_INSTRUCTIONS=1 -DCMAKE_BUILD_TYPE=RELEASE .."
+[ "$ANS" == "y" ] || DLIB_BUILD="cmake -DUSE_AVX_INSTRUCTIONS=0 -DCMAKE_BUILD_TYPE=RELEASE .."
+
+OCV_BUILD="rm -rf ./opencv-${OCV_VERSION}/cmake_binary && "
+OCV_BUILD+=" mkdir ./opencv-${OCV_VERSION}/cmake_binary && "
+OCV_BUILD+="cd ./opencv-${OCV_VERSION}/cmake_binary && "
+OCV_BUILD+="cmake $OCV_OPT $OCV_OPTPY3 $OCV_OPTCUDA $OCV_OTHER .. && "
+OCV_BUILD+="make -j 4 && make install"
+
+echo -e "$C_LMAGENTA "
+echo "******************************************************"
+echo "** STARTING THE BUILD / DOWNLOAD PROCEDURE          **" 
+echo "** Check OpenCV existing, unzipped or download      **"
+echo "** This may require time..."
+OCV_LINK="https://github.com/opencv/opencv/archive/"
+OCVC_LINK="https://github.com/opencv/opencv_contrib/archive/"
+if [ ! -f "$OCV_VERSION".zip ]; then
+	echo "Cannot find OpenCV$CV_VERSION zip file, downloading..."
+	wget "${OCV_LINK}${OCV_VERSION}.zip"
+fi
+
+echo "Check if we already downnloaded here Opencv-X.X.X.zip"
+if [ ! -f "$OCV_VERSION"_contrib.zip ]; then
+	echo "Cannot find OpenCV CONTRIB zip file, downloading..."
+	wget "${OCVC_LINK}${OCV_VERSION}.zip" -O ${OCV_VERSION}_contrib.zip
+fi
+if [ ! -d opencv-"$OCV_VERSION" ]; then
+	echo "OpenCV directory not found, unzipping now"
+	unzip -q ${OCV_VERSION}.zip
+	mkdir ./opencv-${OCV_VERSION}/cmake_binary
+	unzip -q ${OCV_VERSION}_contrib.zip
+fi
+
+
+
+
+if [ ! -f v"$DLIB_VERSION".zip ]; then
+	echo "Cannot find DLIB zip file, downloading..."
+	wget https://github.com/davisking/dlib/archive/v${DLIB_VERSION}.zip
+fi
+
+echo "Check if DLib was unzipped"
+if [ ! -d dlib-"$DLIB_VERSION" ]; then
+	echo "DLIB directory not found, unzipping now"
+	unzip v${DLIB_VERSION}.zip
+fi
+
+
+
+
+
+DLIB_CMD="rm -rf mkdir ./dlib-${DLIB_VERSION}/cmake_binary && mkdir ./dlib-${DLIB_VERSION}/cmake_binary && cd dlib-${DLIB_VERSION}/cmake_binary && $DLIB_BUILD && make && make install"
+
+
+
+############################################################
+#
+# CONFIGURATION IS TERMINATED
+# START OPERATION ON MACHINE OR GENERATE FULL DOCKERFILE
+#
+############################################################
+
+
+
+
+
+echo -e "$C_WHITE "
+if $interactive ; then
+	if [ "$DEFAULT_COMPONENT" == "" ] ; then
+		echo "Now Installing required Pagkages, may require long time"
+		echo "PACKAGES: $APT_PKGS"
+		input_ANS "Hit RETURN to Start" "W"
+		dockerAPT $APT_PKGS
+
+		echo "Now Installing Python Packages"
+		echo "P2 PACK: $PY2_PKGS"
+		echo "P3 PACK: $PY3_PKGS"
+		input_ANS "Hit RETURN to Start" "W"
+
+		dockerCMD "pip3 install --upgrade pip"
+		[ $PY2 == "y" ] && dockerCMD "pip2 install --upgrade pip"
+		dockerCMD "pip3.6 --no-cache-dir install $PY3_PKGS"
+		[ $PY2 == "y" ] && dockerCMD "pip2 --no-cache-dir install $PY2_PKGS"
+	fi
+
+	if [ "$DEFAULT_COMPONENT" != "DLIB" ] ; then 
+		echo "Now Building OpenCV Stuff"
+		input_ANS "Hit RETURN to Start" "W"
+		cd /setup
+		echo "BUILD CMD: $OCV_BUILD"
+		dockerCMD "$OCV_BUILD"
+	fi
+
+	if [ "$DEFAULT_COMPONENT" != "OpenCV" ] ; then
+		echo "Now Building DLIB Stuff"
+		input_ANS "Hit RETURN to Start" "W"
+		cd /setup
+		echo "BUILD CMD: $DLIB_CMD"
+		dockerCMD "$DLIB_CMD"
+	fi
+	if $USE_WINGIDE ; then
+		cd /setup
+		test -f "./wingide-personal6_6.1.4-1_amd64.deb"  && wget "https://wingware.com/pub/wingide-personal/6.1.4/wingide-personal6_6.1.4-1_amd64.deb"
+		dockerCMD "dpkg -i './wingide-personal6_6.1.4-1_amd64.deb'"
+	fi
+else
+	echo "NOW Generating a docker Dockerfile"
+	dockerAPT " $APT_PKGS "
+	dockerCMD "pip3.6 install --upgrade pip3"
+	[ $PY2 == "y" ] && dockerCMD "pip install --upgrade pip"
+	dockerCMD "pip3.6 --no-cache-dir install $PY3_PKGS"
+	[ $PY2 == "y" ] && dockerCMD "pip --no-cache-dir install $PY2_PKGS"
+
+	dockerCMD "$OCV_BUILD"
+	dockerCMD "$DLIB_CMD"
+	if $USE_WINGIDE ; then
+		test -f "./wingide-personal6_6.1.4-1_amd64.deb"  && wget "https://wingware.com/pub/wingide-personal/6.1.4/wingide-personal6_6.1.4-1_amd64.deb"
+		dockerCMD "dpkg -i 'wingide-personal6_6.1.4-1_amd64.deb'"
+	fi
+
+	echo -e $(echo $dockerfile)
+	echo -e $dockerfile > Dockerfile
+fi
+
+
+
+echo -e "$C_LGREEN "
+echo "******************************************************"
+echo "**     4. CLEANING PACKAGE INFORMATION              **"
+echo "******************************************************"
+echo "**"
+echo "** We could clean package information in image to make"
+echo "** Image size smaller"
+echo "**"
+input_ANS "Would you like to clean the apt in target [y/N]?" "N"
+test "$ANS" == "y"  && dockerCMD "rm -rf /var/lib/apt/lists/*"
+
+
+############################################################
+# Install Caffe
+#RUN git clone -b ${CAFFE_VERSION} --depth 1 https://github.com/BVLC/caffe.git /root/caffe && \
+#	cd /root/caffe && \
+#	cat python/requirements.txt | xargs -n1 pip install && \
+#	mkdir build && cd build && \
+#	cmake -DUSE_CUDNN=1 -DBLAS=Open .. && \
+#	make -j"$(nproc)" all && \
+#	make install
+# Set up Caffe environment variables
+#ENV CAFFE_ROOT=/root/caffe
+#ENV PYCAFFE_ROOT=$CAFFE_ROOT/python
+#ENV PYTHONPATH=$PYCAFFE_ROOT:$PYTHONPATH \
+#	PATH=$CAFFE_ROOT/build/tools:$PYCAFFE_ROOT:$PATH
+#RUN echo "$CAFFE_ROOT/build/lib" >> /etc/ld.so.conf.d/caffe.conf && ldconfig
+
+
+############################################################
+# Install Theano and set up Theano config (.theanorc) for CUDA and OpenBLAS
+#RUN pip --no-cache-dir install git+git://github.com/Theano/Theano.git@${THEANO_VERSION} && \
+#	\
+#	echo "[global]\ndevice=gpu\nfloatX=float32\noptimizer_including=cudnn\nmode=FAST_RUN \
+#		\n[lib]\ncnmem=0.95 \
+#		\n[nvcc]\nfastmath=True \
+#		\n[blas]\nldflag = -L/usr/lib/openblas-base -lopenblas \
+#		\n[DebugMode]\ncheck_finite=1" \
+#	> /root/.theanorc
+
+
+############################################################
+# Install Keras from GIT
+#RUN pip --no-cache-dir install git+git://github.com/fchollet/keras.git@${KERAS_VERSION}
+
+
+############################################################
+# Install Lasagne
+#RUN pip --no-cache-dir install git+git://github.com/Lasagne/Lasagne.git@${LASAGNE_VERSION}
+
+
+############################################################
+# Install Torch from GIT
+#RUN git clone https://github.com/torch/distro.git /root/torch --recursive && \
+#	cd /root/torch && \
+#	bash install-deps && \
+#	yes no | ./install.sh
+
+
+
+
+
